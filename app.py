@@ -344,10 +344,7 @@ def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_n
                   [g2_safe] * len(group2_samples))
     metadata = pd.DataFrame({"condition": conditions}, index=all_samples)
 
-    dds = DeseqDataSet(
-        counts=counts, metadata=metadata, design="~condition",
-        n_cpus=1,  # limit CPU/memory usage
-    )
+    dds = DeseqDataSet(counts=counts, metadata=metadata, design="~condition")
     dds.deseq2()
 
     stat_res = DeseqStats(dds, contrast=["condition", g2_safe, g1_safe])
