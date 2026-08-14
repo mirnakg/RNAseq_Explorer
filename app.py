@@ -59,9 +59,12 @@ def load_geo_data(accession):
 
     # ── Collect sample metadata (always available) ────────────
     sample_metadata = {}
+    gsm_title_map = {}  # GSM ID -> sample title (for matching suppl columns)
     for gsm_name, gsm in gse.gsms.items():
         chars = {}
-        chars["title"] = gsm.metadata.get("title", [""])[0]
+        sample_title = gsm.metadata.get("title", [""])[0]
+        chars["title"] = sample_title
+        gsm_title_map[gsm_name] = sample_title
         for ch in gsm.metadata.get("characteristics_ch1", []):
             if ":" in ch:
                 key, val = ch.split(":", 1)
@@ -117,7 +120,6 @@ def load_geo_data(accession):
     # ── Strategy 2: supplementary count matrix files ──────────
     suppl_files = gse.metadata.get("supplementary_file", [])
 
-    # Find count / expression matrix files
     count_keywords = ["count", "readcount", "read_count", "expression", "matrix",
                       "fpkm", "tpm", "rpkm", "raw"]
     matrix_extensions = (".csv.gz", ".tsv.gz", ".txt.gz", ".csv", ".tsv", ".txt")
@@ -127,16 +129,13 @@ def load_geo_data(accession):
         url_lower = url.lower()
         if not any(url_lower.endswith(ext) for ext in matrix_extensions):
             continue
-        # Prioritise files whose name suggests a count/expression matrix
         has_keyword = any(kw in url_lower for kw in count_keywords)
         candidate_urls.append((has_keyword, url))
 
-    # Sort so keyword-matched files come first
     candidate_urls.sort(key=lambda x: x[0], reverse=True)
 
     for _, url in candidate_urls:
         try:
-            # Convert FTP URLs to HTTPS
             dl_url = url
             if dl_url.startswith("ftp://"):
                 dl_url = dl_url.replace(
@@ -160,8 +159,35 @@ def load_geo_data(accession):
             expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
             expr_df = expr_df.dropna(how="all")
 
-            # Basic sanity check: must have at least 100 genes and 2 samples
             if expr_df.shape[0] >= 100 and expr_df.shape[1] >= 2:
+                # ── Reconcile column names with metadata ──────
+                # Expression columns might be sample names, not GSM IDs.
+                # Try to match them to GSM IDs via sample titles.
+                expr_cols = set(expr_df.columns)
+                gsm_ids = set(meta_df.index)
+
+                if not expr_cols & gsm_ids:
+                    # No overlap — try matching by title
+                    title_to_gsm = {v: k for k, v in gsm_title_map.items()}
+                    # Also try normalised versions (strip, lower)
+                    title_to_gsm_lower = {v.strip().lower(): k for k, v in gsm_title_map.items()}
+
+                    col_to_gsm = {}
+                    for col in expr_df.columns:
+                        if col in title_to_gsm:
+                            col_to_gsm[col] = title_to_gsm[col]
+                        elif col.strip().lower() in title_to_gsm_lower:
+                            col_to_gsm[col] = title_to_gsm_lower[col.strip().lower()]
+
+                    if col_to_gsm:
+                        # Rename expression columns to GSM IDs
+                        expr_df = expr_df.rename(columns=col_to_gsm)
+                    else:
+                        # Can't map — rebuild metadata indexed by expression columns
+                        # Use column names as sample IDs
+                        meta_df = pd.DataFrame({"title": expr_df.columns}, index=expr_df.columns)
+                        meta_df.index.name = "sample"
+
                 return expr_df, meta_df, title, summary
 
         except Exception:
@@ -178,7 +204,6 @@ def _detect_sep_and_read(file_obj):
     """Detect separator and compression, then read as DataFrame."""
     name = file_obj.name.lower()
     compression = "gzip" if name.endswith(".gz") else None
-    # Strip .gz to check the actual extension
     base = name.removesuffix(".gz")
     sep = "\t" if base.endswith((".tsv", ".txt")) else ","
     return pd.read_csv(file_obj, sep=sep, index_col=0, compression=compression)
@@ -199,15 +224,23 @@ def parse_uploaded_metadata(meta_file):
 
 def run_pca(expr_df, n_components=2):
     """Run PCA on expression matrix (genes x samples)."""
-    # Transpose so samples are rows
+    # Transpose so samples are rows, drop genes with any NaN
     data = expr_df.T.dropna(axis=1)
-    # Filter low-variance genes
+    # Remove zero-variance genes
+    gene_var = data.var()
+    data = data.loc[:, gene_var > 0]
+    # Take top variable genes
     gene_var = data.var()
     top_genes = gene_var.nlargest(min(2000, len(gene_var))).index
     data_filtered = data[top_genes]
 
+    # Replace any remaining inf/nan
+    data_filtered = data_filtered.replace([np.inf, -np.inf], np.nan).fillna(0)
+
     scaler = StandardScaler()
     scaled = scaler.fit_transform(data_filtered)
+    # Guard against NaN from scaling
+    scaled = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
     pca = PCA(n_components=n_components)
     components = pca.fit_transform(scaled)
@@ -241,9 +274,7 @@ def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_n
     all_samples = group1_samples + group2_samples
     counts = expr_df[all_samples].T
 
-    # Ensure integer counts
     counts = counts.round().astype(int)
-    # Remove genes with all zeros
     counts = counts.loc[:, (counts > 0).any(axis=0)]
 
     conditions = ([group1_name] * len(group1_samples) +
@@ -274,21 +305,17 @@ def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_
     g1 = expr_df[group1_samples]
     g2 = expr_df[group2_samples]
 
-    # Log2 fold change (mean of group2 - mean of group1)
     mean1 = g1.mean(axis=1)
     mean2 = g2.mean(axis=1)
 
-    # Check if data looks like it's already log-transformed
     data_range = expr_df.max().max() - expr_df.min().min()
-    is_log = data_range < 30  # heuristic: log data typically spans ~0-15
+    is_log = data_range < 30
 
     if is_log:
-        log2fc = mean2 - mean1  # already in log space
+        log2fc = mean2 - mean1
     else:
-        # Add pseudocount and compute log2FC
         log2fc = np.log2((mean2 + 1) / (mean1 + 1))
 
-    # T-test per gene
     pvalues = []
     for gene in expr_df.index:
         vals1 = g1.loc[gene].values.astype(float)
@@ -302,11 +329,10 @@ def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_
     pvalues = np.array(pvalues)
 
     # BH correction
-    from scipy.stats import false_discovery_control
     try:
+        from scipy.stats import false_discovery_control
         padj = false_discovery_control(pvalues, method="bh")
     except Exception:
-        # Fallback manual BH
         n = len(pvalues)
         sorted_idx = np.argsort(pvalues)
         padj = np.ones(n)
@@ -352,12 +378,10 @@ def make_volcano_plot(deg_results, fc_thresh=1.0, pval_thresh=0.05, top_n_labels
         labels={"log2FC": "log₂ Fold Change", "neg_log10_padj": "-log₁₀ adjusted p-value"},
     )
 
-    # Add threshold lines
     fig.add_hline(y=-np.log10(pval_thresh), line_dash="dash", line_color="#888", line_width=1)
     fig.add_vline(x=fc_thresh, line_dash="dash", line_color="#888", line_width=1)
     fig.add_vline(x=-fc_thresh, line_dash="dash", line_color="#888", line_width=1)
 
-    # Label top significant genes
     sig_genes = df[df["significant"] != "Not significant"].nlargest(top_n_labels, "neg_log10_padj")
     for gene_name, row in sig_genes.iterrows():
         fig.add_annotation(
@@ -385,10 +409,10 @@ def make_pca_plot(pca_df, variance, color_col=None, meta_df=None):
     plot_df = plot_df.reset_index()
 
     if color_col and meta_df is not None and color_col in meta_df.columns:
-        plot_df = plot_df.merge(
-            meta_df[[color_col]].reset_index(),
-            left_on="sample", right_on="sample", how="left"
-        )
+        merge_meta = meta_df[[color_col]].copy()
+        merge_meta.index.name = "sample"
+        merge_meta = merge_meta.reset_index()
+        plot_df = plot_df.merge(merge_meta, on="sample", how="left")
         color = color_col
     else:
         color = None
@@ -423,10 +447,10 @@ def make_gene_plot(expr_df, gene, meta_df=None, group_col=None):
     plot_df = pd.DataFrame({"sample": values.index, "expression": values.values})
 
     if group_col and meta_df is not None and group_col in meta_df.columns:
-        plot_df = plot_df.merge(
-            meta_df[[group_col]].reset_index(),
-            left_on="sample", right_on="sample", how="left"
-        )
+        merge_meta = meta_df[[group_col]].copy()
+        merge_meta.index.name = "sample"
+        merge_meta = merge_meta.reset_index()
+        plot_df = plot_df.merge(merge_meta, on="sample", how="left")
         fig = px.box(
             plot_df, x=group_col, y="expression",
             points="all", hover_name="sample",
@@ -509,7 +533,6 @@ if data_source == "GEO Accession":
         except Exception as e:
             st.error(f"Error loading {accession}: {str(e)}")
 
-    # Restore from session state
     if "expr_df" in st.session_state and data_source == "GEO Accession":
         expr_df = st.session_state["expr_df"]
         meta_df = st.session_state["meta_df"]
@@ -520,9 +543,11 @@ else:
                 "and optionally a **sample metadata** file.")
     up_col1, up_col2 = st.columns(2)
     with up_col1:
-        counts_file = st.file_uploader("Expression matrix (.csv, .tsv, .txt, .gz)", type=["csv", "tsv", "txt", "gz"])
+        counts_file = st.file_uploader("Expression matrix (.csv, .tsv, .txt, .gz)",
+                                       type=["csv", "tsv", "txt", "gz"])
     with up_col2:
-        meta_file = st.file_uploader("Sample metadata (.csv, .tsv, .txt, .gz) — optional", type=["csv", "tsv", "txt", "gz"])
+        meta_file = st.file_uploader("Sample metadata (.csv, .tsv, .txt, .gz) — optional",
+                                     type=["csv", "tsv", "txt", "gz"])
 
     if counts_file:
         try:
@@ -548,13 +573,19 @@ if expr_df is not None:
         st.markdown(f"**{dataset_title}**")
     st.caption(f"{expr_df.shape[0]:,} genes × {expr_df.shape[1]:,} samples")
 
+    all_samples = list(expr_df.columns)
+
     # Determine available grouping columns from metadata
     group_options = []
     if meta_df is not None and not meta_df.empty:
-        for col in meta_df.columns:
-            nunique = meta_df[col].nunique()
-            if 2 <= nunique <= 50:
-                group_options.append(col)
+        # Only consider metadata columns whose index overlaps with expression columns
+        common = set(meta_df.index) & set(all_samples)
+        if common:
+            for col in meta_df.columns:
+                vals = meta_df.loc[meta_df.index.isin(all_samples), col].dropna()
+                nunique = vals.nunique()
+                if 2 <= nunique <= 50:
+                    group_options.append(col)
 
     # ── TABS ──
     tab_preview, tab_pca, tab_deg, tab_gene = st.tabs(
@@ -570,14 +601,14 @@ if expr_df is not None:
             st.markdown('<div class="step-header">Sample Metadata</div>', unsafe_allow_html=True)
             st.dataframe(meta_df, use_container_width=True, height=300)
 
-        # Download expression matrix
         csv_buf = expr_df.to_csv()
         st.download_button("Download expression matrix (.csv)", csv_buf,
                            file_name="expression_matrix.csv", mime="text/csv")
 
     # ── PCA ───────────────────────────────────────────────────
     with tab_pca:
-        st.markdown('<div class="step-header">Principal Component Analysis</div>', unsafe_allow_html=True)
+        st.markdown('<div class="step-header">Principal Component Analysis</div>',
+                    unsafe_allow_html=True)
 
         pca_color = None
         if group_options:
@@ -601,104 +632,133 @@ if expr_df is not None:
         st.markdown('<div class="step-header">Differential Expression Analysis</div>',
                     unsafe_allow_html=True)
 
-        if not group_options:
-            st.warning("No grouping columns found in metadata. "
-                       "Please provide sample metadata with a condition column "
-                       "(at least 2 groups, at most 50).")
-            if meta_df is None:
-                st.info("If you loaded from GEO, the metadata was extracted automatically. "
-                        "If uploading, provide a metadata CSV with sample IDs as the first column "
-                        "and condition columns.")
-        else:
-            deg_group_col = st.selectbox("Group samples by", group_options, key="deg_group")
+        deg_mode = st.radio(
+            "How would you like to define groups?",
+            ["From metadata column", "Manual sample selection"],
+            horizontal=True, key="deg_mode",
+        )
 
-            groups = meta_df[deg_group_col].dropna().unique().tolist()
+        group1_samples = []
+        group2_samples = []
+        group1_name = "Control"
+        group2_name = "Treatment"
 
-            dcol1, dcol2 = st.columns(2)
-            with dcol1:
-                group1_name = st.selectbox("Control / Reference group", groups, key="g1")
-            with dcol2:
-                remaining = [g for g in groups if g != group1_name]
-                group2_name = st.selectbox("Treatment / Comparison group",
-                                           remaining if remaining else groups, key="g2")
-
-            # Check if data looks like raw counts
-            is_counts = (expr_df.values % 1 == 0).all() and (expr_df.values >= 0).all()
-
-            if is_counts:
-                method = st.radio(
-                    "Analysis method",
-                    ["DESeq2 (recommended for count data)", "Basic t-test"],
-                    horizontal=True, key="deg_method",
-                )
-                use_deseq2 = "DESeq2" in method
+        if deg_mode == "From metadata column":
+            if not group_options:
+                st.warning("No usable grouping columns found in metadata. "
+                           "Use **Manual sample selection** instead, or provide "
+                           "metadata with a condition column.")
             else:
-                st.caption("Data appears to be normalized/log-transformed — using t-test with BH correction.")
-                use_deseq2 = False
+                deg_group_col = st.selectbox("Group samples by", group_options, key="deg_group")
+                groups = meta_df.loc[
+                    meta_df.index.isin(all_samples), deg_group_col
+                ].dropna().unique().tolist()
 
-            # Threshold settings
-            tcol1, tcol2, tcol3 = st.columns(3)
-            with tcol1:
-                fc_thresh = st.number_input("log₂FC threshold", value=1.0, min_value=0.0,
-                                            step=0.25, key="fc_thresh")
-            with tcol2:
-                pval_thresh = st.number_input("Adj. p-value threshold", value=0.05,
-                                              min_value=0.001, max_value=1.0,
-                                              step=0.01, format="%.3f", key="pval_thresh")
-            with tcol3:
-                top_labels = st.number_input("Top genes to label", value=10, min_value=0,
-                                             max_value=50, key="top_labels")
+                dcol1, dcol2 = st.columns(2)
+                with dcol1:
+                    group1_name = st.selectbox("Control / Reference group", groups, key="g1")
+                with dcol2:
+                    remaining = [g for g in groups if g != group1_name]
+                    group2_name = st.selectbox("Treatment / Comparison group",
+                                               remaining if remaining else groups, key="g2")
 
-            if st.button("Run DEG Analysis", type="primary", key="run_deg"):
-                group1_samples = meta_df[meta_df[deg_group_col] == group1_name].index.tolist()
-                group2_samples = meta_df[meta_df[deg_group_col] == group2_name].index.tolist()
+                group1_samples = meta_df[
+                    (meta_df[deg_group_col] == group1_name) &
+                    (meta_df.index.isin(all_samples))
+                ].index.tolist()
+                group2_samples = meta_df[
+                    (meta_df[deg_group_col] == group2_name) &
+                    (meta_df.index.isin(all_samples))
+                ].index.tolist()
 
-                # Filter to samples that exist in expression matrix
-                group1_samples = [s for s in group1_samples if s in expr_df.columns]
-                group2_samples = [s for s in group2_samples if s in expr_df.columns]
+                st.caption(f"Group 1: {len(group1_samples)} samples — "
+                           f"Group 2: {len(group2_samples)} samples")
 
-                if len(group1_samples) < 2 or len(group2_samples) < 2:
-                    st.error("Each group needs at least 2 samples.")
-                else:
-                    with st.spinner("Running analysis..."):
-                        try:
-                            deg_results = run_deg_analysis(
-                                expr_df, group1_samples, group2_samples,
-                                group1_name, group2_name, use_deseq2=use_deseq2,
-                            )
-                            st.session_state["deg_results"] = deg_results
-                        except Exception as e:
-                            st.error(f"DEG analysis failed: {str(e)}")
+        else:  # Manual sample selection
+            st.markdown("Select samples for each group from the expression matrix columns.")
+            mcol1, mcol2 = st.columns(2)
+            with mcol1:
+                group1_name = st.text_input("Group 1 name", value="Control", key="manual_g1_name")
+                group1_samples = st.multiselect(
+                    f"Samples in **{group1_name}**", all_samples, key="manual_g1",
+                )
+            with mcol2:
+                available_for_g2 = [s for s in all_samples if s not in group1_samples]
+                group2_name = st.text_input("Group 2 name", value="Treatment", key="manual_g2_name")
+                group2_samples = st.multiselect(
+                    f"Samples in **{group2_name}**", available_for_g2, key="manual_g2",
+                )
 
-            # Show results if available
-            if "deg_results" in st.session_state:
-                deg_results = st.session_state["deg_results"]
+        # Check if data looks like raw counts
+        sample_vals = expr_df.values
+        is_counts = (sample_vals % 1 == 0).all() and (sample_vals >= 0).all()
 
-                n_up = ((deg_results["padj"] < pval_thresh) & (deg_results["log2FC"] > fc_thresh)).sum()
-                n_down = ((deg_results["padj"] < pval_thresh) & (deg_results["log2FC"] < -fc_thresh)).sum()
+        if is_counts:
+            method = st.radio(
+                "Analysis method",
+                ["DESeq2 (recommended for count data)", "Basic t-test"],
+                horizontal=True, key="deg_method",
+            )
+            use_deseq2 = "DESeq2" in method
+        else:
+            st.caption("Data appears to be normalized/log-transformed — using t-test with BH correction.")
+            use_deseq2 = False
 
-                rcol1, rcol2, rcol3 = st.columns(3)
-                rcol1.metric("Total genes tested", f"{len(deg_results):,}")
-                rcol2.metric("Upregulated", f"{n_up:,}")
-                rcol3.metric("Downregulated", f"{n_down:,}")
+        # Threshold settings
+        tcol1, tcol2, tcol3 = st.columns(3)
+        with tcol1:
+            fc_thresh = st.number_input("log₂FC threshold", value=1.0, min_value=0.0,
+                                        step=0.25, key="fc_thresh")
+        with tcol2:
+            pval_thresh = st.number_input("Adj. p-value threshold", value=0.05,
+                                          min_value=0.001, max_value=1.0,
+                                          step=0.01, format="%.3f", key="pval_thresh")
+        with tcol3:
+            top_labels = st.number_input("Top genes to label", value=10, min_value=0,
+                                         max_value=50, key="top_labels")
 
-                # Volcano plot
-                st.markdown('<div class="step-header">Volcano Plot</div>', unsafe_allow_html=True)
-                fig = make_volcano_plot(deg_results, fc_thresh=fc_thresh,
-                                        pval_thresh=pval_thresh, top_n_labels=top_labels)
-                st.plotly_chart(fig, use_container_width=True)
+        can_run_deg = len(group1_samples) >= 2 and len(group2_samples) >= 2
 
-                # Results table
-                with st.expander("DEG results table"):
-                    st.dataframe(
-                        deg_results[["log2FC", "pvalue", "padj"]].head(200),
-                        use_container_width=True,
+        if st.button("Run DEG Analysis", type="primary", key="run_deg", disabled=not can_run_deg):
+            with st.spinner("Running analysis..."):
+                try:
+                    deg_results = run_deg_analysis(
+                        expr_df, group1_samples, group2_samples,
+                        group1_name, group2_name, use_deseq2=use_deseq2,
                     )
+                    st.session_state["deg_results"] = deg_results
+                except Exception as e:
+                    st.error(f"DEG analysis failed: {str(e)}")
 
-                # Download
-                csv_buf = deg_results.to_csv()
-                st.download_button("Download full DEG results (.csv)", csv_buf,
-                                   file_name="deg_results.csv", mime="text/csv")
+        if not can_run_deg:
+            st.caption("Select at least 2 samples per group to run analysis.")
+
+        # Show results if available
+        if "deg_results" in st.session_state:
+            deg_results = st.session_state["deg_results"]
+
+            n_up = ((deg_results["padj"] < pval_thresh) & (deg_results["log2FC"] > fc_thresh)).sum()
+            n_down = ((deg_results["padj"] < pval_thresh) & (deg_results["log2FC"] < -fc_thresh)).sum()
+
+            rcol1, rcol2, rcol3 = st.columns(3)
+            rcol1.metric("Total genes tested", f"{len(deg_results):,}")
+            rcol2.metric("Upregulated", f"{n_up:,}")
+            rcol3.metric("Downregulated", f"{n_down:,}")
+
+            st.markdown('<div class="step-header">Volcano Plot</div>', unsafe_allow_html=True)
+            fig = make_volcano_plot(deg_results, fc_thresh=fc_thresh,
+                                    pval_thresh=pval_thresh, top_n_labels=top_labels)
+            st.plotly_chart(fig, use_container_width=True)
+
+            with st.expander("DEG results table"):
+                st.dataframe(
+                    deg_results[["log2FC", "pvalue", "padj"]].head(200),
+                    use_container_width=True,
+                )
+
+            csv_buf = deg_results.to_csv()
+            st.download_button("Download full DEG results (.csv)", csv_buf,
+                               file_name="deg_results.csv", mime="text/csv")
 
     # ── GENE SEARCH ───────────────────────────────────────────
     with tab_gene:
@@ -715,10 +775,8 @@ if expr_df is not None:
 
         if gene_query:
             query = gene_query.strip().upper()
-            # Find matching genes (exact or partial)
             exact = [g for g in expr_df.index if str(g).upper() == query]
             partial = [g for g in expr_df.index if query in str(g).upper() and str(g).upper() != query]
-
             matches = exact + partial[:20]
 
             if not matches:
@@ -734,7 +792,6 @@ if expr_df is not None:
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Show expression values
                     with st.expander("Expression values"):
                         gene_vals = expr_df.loc[selected_gene].to_frame("expression")
                         if meta_df is not None and gene_group_col:
@@ -743,7 +800,6 @@ if expr_df is not None:
                             )
                         st.dataframe(gene_vals, use_container_width=True)
 
-                    # If DEG results exist, show this gene's stats
                     if "deg_results" in st.session_state and selected_gene in st.session_state["deg_results"].index:
                         gene_deg = st.session_state["deg_results"].loc[selected_gene]
                         st.markdown(f"**DEG stats:** log₂FC = {gene_deg['log2FC']:.3f}, "
