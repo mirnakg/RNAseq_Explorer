@@ -326,11 +326,16 @@ def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_n
     counts = counts.fillna(0)
     counts = counts.clip(lower=0)
     counts = counts.round().astype(int)
-    # Drop genes with all zeros
-    counts = counts.loc[:, (counts > 0).any(axis=0)]
+
+    # Pre-filter genes to reduce memory: keep genes with at least 10 total
+    # counts across all samples AND detected in at least 2 samples
+    gene_totals = counts.sum(axis=0)
+    gene_detected = (counts > 0).sum(axis=0)
+    keep = (gene_totals >= 10) & (gene_detected >= 2)
+    counts = counts.loc[:, keep]
 
     if counts.shape[1] < 2:
-        raise ValueError("Not enough expressed genes for DESeq2 analysis.")
+        raise ValueError("Not enough expressed genes for DESeq2 analysis after filtering.")
 
     # Sanitise group names for the design formula (no spaces/special chars)
     g1_safe = "group1"
@@ -339,7 +344,10 @@ def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_n
                   [g2_safe] * len(group2_samples))
     metadata = pd.DataFrame({"condition": conditions}, index=all_samples)
 
-    dds = DeseqDataSet(counts=counts, metadata=metadata, design="~condition")
+    dds = DeseqDataSet(
+        counts=counts, metadata=metadata, design="~condition",
+        n_cpus=1,  # limit CPU/memory usage
+    )
     dds.deseq2()
 
     stat_res = DeseqStats(dds, contrast=["condition", g2_safe, g1_safe])
