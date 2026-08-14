@@ -7,4 +7,3 @@ scipy
 GEOparse
 pydeseq2
 requests
-adjustText
