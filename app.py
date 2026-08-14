@@ -117,12 +117,19 @@ def load_geo_data(accession):
     return expr_df, meta_df, title, summary
 
 
+def _detect_sep_and_read(file_obj):
+    """Detect separator and compression, then read as DataFrame."""
+    name = file_obj.name.lower()
+    compression = "gzip" if name.endswith(".gz") else None
+    # Strip .gz to check the actual extension
+    base = name.removesuffix(".gz")
+    sep = "\t" if base.endswith((".tsv", ".txt")) else ","
+    return pd.read_csv(file_obj, sep=sep, index_col=0, compression=compression)
+
+
 def parse_uploaded_counts(counts_file):
     """Parse uploaded count/expression matrix."""
-    if counts_file.name.endswith(".tsv") or counts_file.name.endswith(".txt"):
-        df = pd.read_csv(counts_file, sep="\t", index_col=0)
-    else:
-        df = pd.read_csv(counts_file, index_col=0)
+    df = _detect_sep_and_read(counts_file)
     df = df.apply(pd.to_numeric, errors="coerce")
     df = df.dropna(how="all")
     return df
@@ -130,11 +137,7 @@ def parse_uploaded_counts(counts_file):
 
 def parse_uploaded_metadata(meta_file):
     """Parse uploaded sample metadata."""
-    if meta_file.name.endswith(".tsv") or meta_file.name.endswith(".txt"):
-        df = pd.read_csv(meta_file, sep="\t", index_col=0)
-    else:
-        df = pd.read_csv(meta_file, index_col=0)
-    return df
+    return _detect_sep_and_read(meta_file)
 
 
 def run_pca(expr_df, n_components=2):
@@ -460,9 +463,9 @@ else:
                 "and optionally a **sample metadata** file.")
     up_col1, up_col2 = st.columns(2)
     with up_col1:
-        counts_file = st.file_uploader("Expression matrix (.csv, .tsv, .txt)", type=["csv", "tsv", "txt"])
+        counts_file = st.file_uploader("Expression matrix (.csv, .tsv, .txt, .gz)", type=["csv", "tsv", "txt", "gz"])
     with up_col2:
-        meta_file = st.file_uploader("Sample metadata (.csv, .tsv, .txt) — optional", type=["csv", "tsv", "txt"])
+        meta_file = st.file_uploader("Sample metadata (.csv, .tsv, .txt, .gz) — optional", type=["csv", "tsv", "txt", "gz"])
 
     if counts_file:
         try:
