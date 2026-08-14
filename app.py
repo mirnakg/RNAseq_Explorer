@@ -42,24 +42,48 @@ div[data-testid="stSidebar"] { background-color: #e8e4db; border-right: 1.5px da
 # HELPER FUNCTIONS
 # ============================================================
 
+def _bh_adjust(pvalues):
+    """Benjamini-Hochberg p-value adjustment."""
+    pvalues = np.asarray(pvalues, dtype=float)
+    n = len(pvalues)
+    if n == 0:
+        return pvalues
+    sorted_idx = np.argsort(pvalues)
+    sorted_pvals = pvalues[sorted_idx]
+    adjusted = np.empty(n)
+    adjusted[-1] = sorted_pvals[-1]
+    for i in range(n - 2, -1, -1):
+        adjusted[i] = min(adjusted[i + 1], sorted_pvals[i] * n / (i + 1))
+    adjusted = np.clip(adjusted, 0, 1)
+    result = np.empty(n)
+    result[sorted_idx] = adjusted
+    return result
+
+
+def _looks_like_counts(expr_df):
+    """Heuristic check whether expression data is raw counts (integers >= 0).
+    Only samples a subset for speed on large matrices."""
+    sample = expr_df.iloc[:min(500, expr_df.shape[0]), :min(20, expr_df.shape[1])]
+    vals = sample.values
+    # Must be numeric, non-negative, and integer-valued
+    finite = vals[np.isfinite(vals)]
+    if len(finite) == 0:
+        return False
+    return bool((finite >= 0).all() and (finite % 1 == 0).all())
+
+
 @st.cache_data(show_spinner="Fetching GEO dataset...")
 def load_geo_data(accession):
-    """Download and parse a GEO dataset.
-
-    Tries two strategies:
-    1. Standard series matrix (microarray / older RNA-seq with embedded values)
-    2. Supplementary count matrix files (.csv.gz, .tsv.gz, .txt.gz) common in
-       modern RNA-seq datasets
-    """
+    """Download and parse a GEO dataset."""
     import GEOparse
     import requests
     import gzip
 
     gse = GEOparse.get_GEO(geo=accession, destdir=tempfile.gettempdir(), silent=True)
 
-    # ── Collect sample metadata (always available) ────────────
+    # ── Collect sample metadata ───────────────────────────────
     sample_metadata = {}
-    gsm_title_map = {}  # GSM ID -> sample title (for matching suppl columns)
+    gsm_title_map = {}
     for gsm_name, gsm in gse.gsms.items():
         chars = {}
         sample_title = gsm.metadata.get("title", [""])[0]
@@ -77,7 +101,7 @@ def load_geo_data(accession):
     title = gse.metadata.get("title", [""])[0]
     summary = gse.metadata.get("summary", [""])[0]
 
-    # ── Strategy 1: series matrix (ID_REF / VALUE per sample) ─
+    # ── Strategy 1: series matrix ─────────────────────────────
     expr_frames = []
     for gsm_name, gsm in gse.gsms.items():
         table = gsm.table
@@ -93,7 +117,7 @@ def load_geo_data(accession):
         expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
         expr_df = expr_df.dropna(how="all")
 
-        # Try to map probe IDs to gene symbols using GPL annotation
+        # Map probes to gene symbols
         for gpl_name, gpl in gse.gpls.items():
             gpl_table = gpl.table
             if gpl_table.empty:
@@ -109,15 +133,13 @@ def load_geo_data(accession):
                 probe_to_gene = probe_to_gene[probe_to_gene.astype(str).str.strip() != ""]
                 probe_to_gene = probe_to_gene[probe_to_gene.astype(str) != "---"]
                 if len(probe_to_gene) > 0:
-                    expr_df.index = expr_df.index.map(
-                        lambda x: probe_to_gene.get(x, x)
-                    )
+                    expr_df.index = expr_df.index.map(lambda x: probe_to_gene.get(x, x))
                     expr_df = expr_df.groupby(expr_df.index).mean()
             break
 
         return expr_df, meta_df, title, summary
 
-    # ── Strategy 2: supplementary count matrix files ──────────
+    # ── Strategy 2: supplementary files ───────────────────────
     suppl_files = gse.metadata.get("supplementary_file", [])
 
     count_keywords = ["count", "readcount", "read_count", "expression", "matrix",
@@ -160,32 +182,29 @@ def load_geo_data(accession):
             expr_df = expr_df.dropna(how="all")
 
             if expr_df.shape[0] >= 100 and expr_df.shape[1] >= 2:
-                # ── Reconcile column names with metadata ──────
-                # Expression columns might be sample names, not GSM IDs.
-                # Try to match them to GSM IDs via sample titles.
+                # Reconcile columns with metadata
                 expr_cols = set(expr_df.columns)
                 gsm_ids = set(meta_df.index)
 
                 if not expr_cols & gsm_ids:
-                    # No overlap — try matching by title
                     title_to_gsm = {v: k for k, v in gsm_title_map.items()}
-                    # Also try normalised versions (strip, lower)
                     title_to_gsm_lower = {v.strip().lower(): k for k, v in gsm_title_map.items()}
 
                     col_to_gsm = {}
                     for col in expr_df.columns:
                         if col in title_to_gsm:
                             col_to_gsm[col] = title_to_gsm[col]
-                        elif col.strip().lower() in title_to_gsm_lower:
-                            col_to_gsm[col] = title_to_gsm_lower[col.strip().lower()]
+                        elif str(col).strip().lower() in title_to_gsm_lower:
+                            col_to_gsm[col] = title_to_gsm_lower[str(col).strip().lower()]
 
                     if col_to_gsm:
-                        # Rename expression columns to GSM IDs
                         expr_df = expr_df.rename(columns=col_to_gsm)
                     else:
-                        # Can't map — rebuild metadata indexed by expression columns
-                        # Use column names as sample IDs
-                        meta_df = pd.DataFrame({"title": expr_df.columns}, index=expr_df.columns)
+                        # Can't map — rebuild metadata from column names
+                        meta_df = pd.DataFrame(
+                            {"title": [str(c) for c in expr_df.columns]},
+                            index=expr_df.columns,
+                        )
                         meta_df.index.name = "sample"
 
                 return expr_df, meta_df, title, summary
@@ -224,22 +243,27 @@ def parse_uploaded_metadata(meta_file):
 
 def run_pca(expr_df, n_components=2):
     """Run PCA on expression matrix (genes x samples)."""
-    # Transpose so samples are rows, drop genes with any NaN
-    data = expr_df.T.dropna(axis=1)
-    # Remove zero-variance genes
-    gene_var = data.var()
-    data = data.loc[:, gene_var > 0]
-    # Take top variable genes
+    data = expr_df.T.copy()
+
+    # Drop columns (genes) that are all NaN or constant
+    data = data.dropna(axis=1, how="all")
+    data = data.fillna(0)
+    data = data.loc[:, data.nunique() > 1]
+
+    if data.shape[1] < 2:
+        raise ValueError("Not enough variable genes to run PCA.")
+
+    n_components = min(n_components, data.shape[0], data.shape[1])
+
+    # Top variable genes
     gene_var = data.var()
     top_genes = gene_var.nlargest(min(2000, len(gene_var))).index
     data_filtered = data[top_genes]
 
-    # Replace any remaining inf/nan
-    data_filtered = data_filtered.replace([np.inf, -np.inf], np.nan).fillna(0)
+    data_filtered = data_filtered.replace([np.inf, -np.inf], 0)
 
     scaler = StandardScaler()
     scaled = scaler.fit_transform(data_filtered)
-    # Guard against NaN from scaling
     scaled = np.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
 
     pca = PCA(n_components=n_components)
@@ -248,11 +272,106 @@ def run_pca(expr_df, n_components=2):
     pca_df = pd.DataFrame(
         components,
         columns=[f"PC{i+1}" for i in range(n_components)],
-        index=expr_df.columns,
+        index=data.index,  # use the transposed index (sample names)
     )
     variance = pca.explained_variance_ratio_
 
     return pca_df, variance
+
+
+def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_name):
+    """Run DESeq2-style analysis using pydeseq2."""
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+
+    all_samples = group1_samples + group2_samples
+    counts = expr_df[all_samples].T.copy()
+
+    # Ensure non-negative integers
+    counts = counts.fillna(0)
+    counts = counts.clip(lower=0)
+    counts = counts.round().astype(int)
+    # Drop genes with all zeros
+    counts = counts.loc[:, (counts > 0).any(axis=0)]
+
+    if counts.shape[1] < 2:
+        raise ValueError("Not enough expressed genes for DESeq2 analysis.")
+
+    # Sanitise group names for the design formula (no spaces/special chars)
+    g1_safe = "group1"
+    g2_safe = "group2"
+    conditions = ([g1_safe] * len(group1_samples) +
+                  [g2_safe] * len(group2_samples))
+    metadata = pd.DataFrame({"condition": conditions}, index=all_samples)
+
+    dds = DeseqDataSet(counts=counts, metadata=metadata, design="~condition")
+    dds.deseq2()
+
+    stat_res = DeseqStats(dds, contrast=["condition", g2_safe, g1_safe])
+    stat_res.summary()
+
+    results = stat_res.results_df.copy()
+    results = results.rename(columns={
+        "log2FoldChange": "log2FC",
+        "pvalue": "pvalue",
+        "padj": "padj",
+    })
+    cols_present = [c for c in ["log2FC", "pvalue", "padj"] if c in results.columns]
+    results = results[cols_present].dropna()
+    results["neg_log10_padj"] = -np.log10(results["padj"].clip(lower=1e-300))
+    results = results.sort_values("pvalue")
+
+    return results
+
+
+def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_name):
+    """Run basic DEG analysis using t-test for normalized data."""
+    g1 = expr_df[group1_samples].copy()
+    g2 = expr_df[group2_samples].copy()
+
+    mean1 = g1.mean(axis=1)
+    mean2 = g2.mean(axis=1)
+
+    # Heuristic: if the max value is small, data is likely already log-transformed
+    max_val = expr_df.max().max()
+    is_log = (max_val < 30) if np.isfinite(max_val) else False
+
+    if is_log:
+        log2fc = mean2 - mean1
+    else:
+        log2fc = np.log2((mean2 + 1) / (mean1 + 1))
+
+    # Vectorised t-test
+    n1, n2 = g1.shape[1], g2.shape[1]
+    var1 = g1.var(axis=1, ddof=1).fillna(0)
+    var2 = g2.var(axis=1, ddof=1).fillna(0)
+
+    se = np.sqrt(var1 / n1 + var2 / n2)
+    t_stat = (mean2 - mean1) / se.replace(0, np.nan)
+
+    # Welch-Satterthwaite degrees of freedom
+    num = (var1 / n1 + var2 / n2) ** 2
+    denom = ((var1 / n1) ** 2 / max(n1 - 1, 1) + (var2 / n2) ** 2 / max(n2 - 1, 1))
+    df_welch = num / denom.replace(0, np.nan)
+
+    pvalues = pd.Series(1.0, index=expr_df.index)
+    valid = t_stat.notna() & df_welch.notna() & (df_welch > 0)
+    pvalues[valid] = 2 * stats.t.sf(np.abs(t_stat[valid]), df_welch[valid])
+    pvalues = pvalues.fillna(1.0).values
+
+    padj = _bh_adjust(pvalues)
+
+    results = pd.DataFrame({
+        "log2FC": log2fc,
+        "pvalue": pvalues,
+        "padj": padj,
+    }, index=expr_df.index)
+
+    results["neg_log10_padj"] = -np.log10(results["padj"].clip(lower=1e-300))
+    results = results.replace([np.inf, -np.inf], np.nan).dropna()
+    results = results.sort_values("pvalue")
+
+    return results
 
 
 def run_deg_analysis(expr_df, group1_samples, group2_samples, group1_name, group2_name,
@@ -266,97 +385,15 @@ def run_deg_analysis(expr_df, group1_samples, group2_samples, group1_name, group
                               group1_name, group2_name)
 
 
-def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_name):
-    """Run DESeq2-style analysis using pydeseq2."""
-    from pydeseq2.dds import DeseqDataSet
-    from pydeseq2.ds import DeseqStats
-
-    all_samples = group1_samples + group2_samples
-    counts = expr_df[all_samples].T
-
-    counts = counts.round().astype(int)
-    counts = counts.loc[:, (counts > 0).any(axis=0)]
-
-    conditions = ([group1_name] * len(group1_samples) +
-                  [group2_name] * len(group2_samples))
-    metadata = pd.DataFrame({"condition": conditions}, index=all_samples)
-
-    dds = DeseqDataSet(counts=counts, metadata=metadata, design="~condition")
-    dds.deseq2()
-
-    stat_res = DeseqStats(dds, contrast=["condition", group2_name, group1_name])
-    stat_res.summary()
-
-    results = stat_res.results_df.copy()
-    results = results.rename(columns={
-        "log2FoldChange": "log2FC",
-        "pvalue": "pvalue",
-        "padj": "padj",
-    })
-    results = results[["log2FC", "pvalue", "padj"]].dropna()
-    results["neg_log10_padj"] = -np.log10(results["padj"].clip(lower=1e-300))
-    results = results.sort_values("pvalue")
-
-    return results
-
-
-def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_name):
-    """Run basic DEG analysis using t-test for normalized data."""
-    g1 = expr_df[group1_samples]
-    g2 = expr_df[group2_samples]
-
-    mean1 = g1.mean(axis=1)
-    mean2 = g2.mean(axis=1)
-
-    data_range = expr_df.max().max() - expr_df.min().min()
-    is_log = data_range < 30
-
-    if is_log:
-        log2fc = mean2 - mean1
-    else:
-        log2fc = np.log2((mean2 + 1) / (mean1 + 1))
-
-    pvalues = []
-    for gene in expr_df.index:
-        vals1 = g1.loc[gene].values.astype(float)
-        vals2 = g2.loc[gene].values.astype(float)
-        if np.std(vals1) == 0 and np.std(vals2) == 0:
-            pvalues.append(1.0)
-        else:
-            _, p = stats.ttest_ind(vals1, vals2, equal_var=False, nan_policy="omit")
-            pvalues.append(p if not np.isnan(p) else 1.0)
-
-    pvalues = np.array(pvalues)
-
-    # BH correction
-    try:
-        from scipy.stats import false_discovery_control
-        padj = false_discovery_control(pvalues, method="bh")
-    except Exception:
-        n = len(pvalues)
-        sorted_idx = np.argsort(pvalues)
-        padj = np.ones(n)
-        for rank, idx in enumerate(sorted_idx, 1):
-            padj[idx] = pvalues[idx] * n / rank
-        padj = np.minimum.accumulate(padj[np.argsort(sorted_idx)][::-1])[::-1]
-        padj = np.clip(padj, 0, 1)
-
-    results = pd.DataFrame({
-        "log2FC": log2fc,
-        "pvalue": pvalues,
-        "padj": padj,
-    }, index=expr_df.index)
-
-    results["neg_log10_padj"] = -np.log10(results["padj"].clip(lower=1e-300))
-    results = results.dropna()
-    results = results.sort_values("pvalue")
-
-    return results
-
-
 def make_volcano_plot(deg_results, fc_thresh=1.0, pval_thresh=0.05, top_n_labels=10):
     """Create an interactive volcano plot."""
     df = deg_results.copy()
+
+    # Cap -log10(padj) to avoid infinite values breaking the plot
+    max_neg_log = df["neg_log10_padj"].replace([np.inf, -np.inf], np.nan).max()
+    cap = max_neg_log * 1.05 if pd.notna(max_neg_log) and max_neg_log > 0 else 50
+    df["neg_log10_padj"] = df["neg_log10_padj"].clip(upper=cap).fillna(0)
+
     df["significant"] = "Not significant"
     df.loc[
         (df["padj"] < pval_thresh) & (df["log2FC"] > fc_thresh), "significant"
@@ -368,7 +405,6 @@ def make_volcano_plot(deg_results, fc_thresh=1.0, pval_thresh=0.05, top_n_labels
     color_map = {"Not significant": "#c0bbb0", "Up": "#cc2a2a", "Down": "#2a52cc"}
 
     plot_df = df.reset_index()
-    # Normalise the gene name column to "gene" regardless of original index name
     gene_col = plot_df.columns[0]
     plot_df = plot_df.rename(columns={gene_col: "gene"})
 
@@ -491,7 +527,6 @@ st.markdown("# RNAseq Explorer")
 st.markdown("**Visualize transcript profiles and differential expression from public or uploaded RNA-seq data.**")
 st.markdown("---")
 
-# Sidebar
 with st.sidebar:
     st.markdown("### Getting Started")
     st.markdown("""
@@ -583,7 +618,6 @@ if expr_df is not None:
     # Determine available grouping columns from metadata
     group_options = []
     if meta_df is not None and not meta_df.empty:
-        # Only consider metadata columns whose index overlaps with expression columns
         common = set(meta_df.index) & set(all_samples)
         if common:
             for col in meta_df.columns:
@@ -651,8 +685,7 @@ if expr_df is not None:
         if deg_mode == "From metadata column":
             if not group_options:
                 st.warning("No usable grouping columns found in metadata. "
-                           "Use **Manual sample selection** instead, or provide "
-                           "metadata with a condition column.")
+                           "Use **Manual sample selection** instead.")
             else:
                 deg_group_col = st.selectbox("Group samples by", group_options, key="deg_group")
                 groups = meta_df.loc[
@@ -679,7 +712,7 @@ if expr_df is not None:
                 st.caption(f"Group 1: {len(group1_samples)} samples — "
                            f"Group 2: {len(group2_samples)} samples")
 
-        else:  # Manual sample selection
+        else:
             st.markdown("Select samples for each group from the expression matrix columns.")
             mcol1, mcol2 = st.columns(2)
             with mcol1:
@@ -694,9 +727,7 @@ if expr_df is not None:
                     f"Samples in **{group2_name}**", available_for_g2, key="manual_g2",
                 )
 
-        # Check if data looks like raw counts
-        sample_vals = expr_df.values
-        is_counts = (sample_vals % 1 == 0).all() and (sample_vals >= 0).all()
+        is_counts = _looks_like_counts(expr_df)
 
         if is_counts:
             method = st.radio(
@@ -709,7 +740,6 @@ if expr_df is not None:
             st.caption("Data appears to be normalized/log-transformed — using t-test with BH correction.")
             use_deseq2 = False
 
-        # Threshold settings
         tcol1, tcol2, tcol3 = st.columns(3)
         with tcol1:
             fc_thresh = st.number_input("log₂FC threshold", value=1.0, min_value=0.0,
@@ -738,7 +768,6 @@ if expr_df is not None:
         if not can_run_deg:
             st.caption("Select at least 2 samples per group to run analysis.")
 
-        # Show results if available
         if "deg_results" in st.session_state:
             deg_results = st.session_state["deg_results"]
 
@@ -801,7 +830,8 @@ if expr_df is not None:
                         gene_vals = expr_df.loc[selected_gene].to_frame("expression")
                         if meta_df is not None and gene_group_col:
                             gene_vals = gene_vals.merge(
-                                meta_df[[gene_group_col]], left_index=True, right_index=True, how="left"
+                                meta_df[[gene_group_col]], left_index=True,
+                                right_index=True, how="left"
                             )
                         st.dataframe(gene_vals, use_container_width=True)
 
