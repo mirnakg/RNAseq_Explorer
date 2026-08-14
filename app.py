@@ -44,28 +44,22 @@ div[data-testid="stSidebar"] { background-color: #e8e4db; border-right: 1.5px da
 
 @st.cache_data(show_spinner="Fetching GEO dataset...")
 def load_geo_data(accession):
-    """Download and parse a GEO Series matrix file."""
+    """Download and parse a GEO dataset.
+
+    Tries two strategies:
+    1. Standard series matrix (microarray / older RNA-seq with embedded values)
+    2. Supplementary count matrix files (.csv.gz, .tsv.gz, .txt.gz) common in
+       modern RNA-seq datasets
+    """
     import GEOparse
+    import requests
+    import gzip
 
     gse = GEOparse.get_GEO(geo=accession, destdir=tempfile.gettempdir(), silent=True)
 
-    # Build expression matrix from platform samples
-    # Try to get the expression table from the first platform
-    expr_frames = []
+    # ── Collect sample metadata (always available) ────────────
     sample_metadata = {}
-
     for gsm_name, gsm in gse.gsms.items():
-        table = gsm.table
-        if table.empty:
-            continue
-
-        # Use ID_REF as gene identifier, VALUE as expression
-        if "ID_REF" in table.columns and "VALUE" in table.columns:
-            series = table.set_index("ID_REF")["VALUE"]
-            series.name = gsm_name
-            expr_frames.append(series)
-
-        # Collect metadata
         chars = {}
         chars["title"] = gsm.metadata.get("title", [""])[0]
         for ch in gsm.metadata.get("characteristics_ch1", []):
@@ -74,47 +68,110 @@ def load_geo_data(accession):
                 chars[key.strip()] = val.strip()
         sample_metadata[gsm_name] = chars
 
-    if not expr_frames:
-        raise ValueError(
-            "Could not extract expression data from this GEO accession. "
-            "The dataset may not contain a standard expression matrix."
-        )
-
-    expr_df = pd.concat(expr_frames, axis=1)
-    expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
-    expr_df = expr_df.dropna(how="all")
-
     meta_df = pd.DataFrame(sample_metadata).T
     meta_df.index.name = "sample"
-
-    # Try to map probe IDs to gene symbols using the GPL annotation
-    for gpl_name, gpl in gse.gpls.items():
-        gpl_table = gpl.table
-        if gpl_table.empty:
-            continue
-        # Look for gene symbol column
-        symbol_col = None
-        for col in gpl_table.columns:
-            if col.upper() in ["GENE_SYMBOL", "GENE SYMBOL", "SYMBOL", "GENE_NAME",
-                                "GENE", "ILMN_GENE", "GENE_ASSIGNMENT"]:
-                symbol_col = col
-                break
-        if symbol_col and "ID" in gpl_table.columns:
-            probe_to_gene = gpl_table.set_index("ID")[symbol_col].dropna()
-            probe_to_gene = probe_to_gene[probe_to_gene.astype(str).str.strip() != ""]
-            probe_to_gene = probe_to_gene[probe_to_gene.astype(str) != "---"]
-            if len(probe_to_gene) > 0:
-                expr_df.index = expr_df.index.map(
-                    lambda x: probe_to_gene.get(x, x)
-                )
-                # Aggregate duplicate gene symbols by mean
-                expr_df = expr_df.groupby(expr_df.index).mean()
-        break
 
     title = gse.metadata.get("title", [""])[0]
     summary = gse.metadata.get("summary", [""])[0]
 
-    return expr_df, meta_df, title, summary
+    # ── Strategy 1: series matrix (ID_REF / VALUE per sample) ─
+    expr_frames = []
+    for gsm_name, gsm in gse.gsms.items():
+        table = gsm.table
+        if table.empty:
+            continue
+        if "ID_REF" in table.columns and "VALUE" in table.columns:
+            series = table.set_index("ID_REF")["VALUE"]
+            series.name = gsm_name
+            expr_frames.append(series)
+
+    if expr_frames:
+        expr_df = pd.concat(expr_frames, axis=1)
+        expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
+        expr_df = expr_df.dropna(how="all")
+
+        # Try to map probe IDs to gene symbols using GPL annotation
+        for gpl_name, gpl in gse.gpls.items():
+            gpl_table = gpl.table
+            if gpl_table.empty:
+                continue
+            symbol_col = None
+            for col in gpl_table.columns:
+                if col.upper() in ["GENE_SYMBOL", "GENE SYMBOL", "SYMBOL", "GENE_NAME",
+                                    "GENE", "ILMN_GENE", "GENE_ASSIGNMENT"]:
+                    symbol_col = col
+                    break
+            if symbol_col and "ID" in gpl_table.columns:
+                probe_to_gene = gpl_table.set_index("ID")[symbol_col].dropna()
+                probe_to_gene = probe_to_gene[probe_to_gene.astype(str).str.strip() != ""]
+                probe_to_gene = probe_to_gene[probe_to_gene.astype(str) != "---"]
+                if len(probe_to_gene) > 0:
+                    expr_df.index = expr_df.index.map(
+                        lambda x: probe_to_gene.get(x, x)
+                    )
+                    expr_df = expr_df.groupby(expr_df.index).mean()
+            break
+
+        return expr_df, meta_df, title, summary
+
+    # ── Strategy 2: supplementary count matrix files ──────────
+    suppl_files = gse.metadata.get("supplementary_file", [])
+
+    # Find count / expression matrix files
+    count_keywords = ["count", "readcount", "read_count", "expression", "matrix",
+                      "fpkm", "tpm", "rpkm", "raw"]
+    matrix_extensions = (".csv.gz", ".tsv.gz", ".txt.gz", ".csv", ".tsv", ".txt")
+
+    candidate_urls = []
+    for url in suppl_files:
+        url_lower = url.lower()
+        if not any(url_lower.endswith(ext) for ext in matrix_extensions):
+            continue
+        # Prioritise files whose name suggests a count/expression matrix
+        has_keyword = any(kw in url_lower for kw in count_keywords)
+        candidate_urls.append((has_keyword, url))
+
+    # Sort so keyword-matched files come first
+    candidate_urls.sort(key=lambda x: x[0], reverse=True)
+
+    for _, url in candidate_urls:
+        try:
+            # Convert FTP URLs to HTTPS
+            dl_url = url
+            if dl_url.startswith("ftp://"):
+                dl_url = dl_url.replace(
+                    "ftp://ftp.ncbi.nlm.nih.gov/geo/",
+                    "https://ftp.ncbi.nlm.nih.gov/geo/",
+                )
+
+            resp = requests.get(dl_url, timeout=120)
+            resp.raise_for_status()
+
+            is_gz = url.lower().endswith(".gz")
+            base = url.lower().removesuffix(".gz")
+            sep = "\t" if base.endswith((".tsv", ".txt")) else ","
+
+            if is_gz:
+                content = gzip.decompress(resp.content).decode("utf-8")
+            else:
+                content = resp.text
+
+            expr_df = pd.read_csv(io.StringIO(content), sep=sep, index_col=0)
+            expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
+            expr_df = expr_df.dropna(how="all")
+
+            # Basic sanity check: must have at least 100 genes and 2 samples
+            if expr_df.shape[0] >= 100 and expr_df.shape[1] >= 2:
+                return expr_df, meta_df, title, summary
+
+        except Exception:
+            continue
+
+    raise ValueError(
+        "Could not extract expression data from this GEO accession. "
+        "The dataset may not contain a standard expression matrix. "
+        "Try downloading the supplementary files manually and uploading them."
+    )
 
 
 def _detect_sep_and_read(file_obj):
