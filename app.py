@@ -703,21 +703,23 @@ if expr_df is not None:
 
     st.markdown("---")
 
-    # ── TABS ──
-    tab_preview, tab_pca, tab_deg, tab_gene = st.tabs(
-        ["Data Preview", "PCA", "DEG Analysis", "Gene Search"]
-    )
+    # Filter expression data to assigned samples only for downstream analysis
+    if has_groups:
+        assigned_sample_list = list(group_assignments.keys())
+        expr_assigned = expr_df[assigned_sample_list]
+    else:
+        expr_assigned = expr_df
 
-    # ── DATA PREVIEW ──────────────────────────────────────────
-    with tab_preview:
+    # ── DATA PREVIEW (collapsible) ────────────────────────────
+    with st.expander("Data Preview"):
         st.markdown('<div class="step-header">Expression Matrix</div>', unsafe_allow_html=True)
         st.dataframe(expr_df.head(50), use_container_width=True, height=400)
 
         if has_groups:
             st.markdown('<div class="step-header">Group Assignments</div>', unsafe_allow_html=True)
             group_df = pd.DataFrame({
-                "sample": all_samples,
-                group_col_name: [group_assignments.get(s, "unassigned") for s in all_samples],
+                "sample": assigned_sample_list,
+                group_col_name: [group_assignments[s] for s in assigned_sample_list],
             }).set_index("sample")
             st.dataframe(group_df, use_container_width=True, height=300)
 
@@ -730,13 +732,18 @@ if expr_df is not None:
         st.download_button("Download expression matrix (.csv)", csv_buf,
                            file_name="expression_matrix.csv", mime="text/csv")
 
+    # ── TABS ──
+    tab_pca, tab_deg, tab_gene = st.tabs(
+        ["PCA", "DEG Analysis", "Gene Search"]
+    )
+
     # ── PCA ───────────────────────────────────────────────────
     with tab_pca:
         st.markdown('<div class="step-header">Principal Component Analysis</div>',
                     unsafe_allow_html=True)
 
         try:
-            pca_df, variance = run_pca(expr_df)
+            pca_df, variance = run_pca(expr_assigned)
 
             # Build plot dataframe with group info
             plot_df = pca_df.copy()
@@ -744,7 +751,7 @@ if expr_df is not None:
             plot_df = plot_df.reset_index()
 
             if has_groups:
-                plot_df[group_col_name] = plot_df["sample"].map(group_assignments).fillna("unassigned")
+                plot_df[group_col_name] = plot_df["sample"].map(group_assignments)
                 color = group_col_name
             else:
                 color = None
@@ -882,12 +889,12 @@ if expr_df is not None:
                 else:
                     selected_gene = matches[0]
 
-                # Build plot with group coloring
-                values = expr_df.loc[selected_gene]
+                # Build plot with group coloring (assigned samples only)
+                values = expr_assigned.loc[selected_gene] if has_groups else expr_df.loc[selected_gene]
                 plot_df = pd.DataFrame({"sample": values.index, "expression": values.values})
 
                 if has_groups:
-                    plot_df[group_col_name] = plot_df["sample"].map(group_assignments).fillna("unassigned")
+                    plot_df[group_col_name] = plot_df["sample"].map(group_assignments)
                     fig = px.box(
                         plot_df, x=group_col_name, y="expression",
                         points="all", hover_name="sample",
@@ -914,9 +921,9 @@ if expr_df is not None:
                 st.plotly_chart(fig, use_container_width=True)
 
                 with st.expander("Expression values"):
-                    gene_vals = expr_df.loc[selected_gene].to_frame("expression")
+                    gene_vals = expr_assigned.loc[selected_gene].to_frame("expression") if has_groups else expr_df.loc[selected_gene].to_frame("expression")
                     if has_groups:
-                        gene_vals[group_col_name] = gene_vals.index.map(group_assignments).fillna("unassigned")
+                        gene_vals[group_col_name] = gene_vals.index.map(group_assignments)
                     st.dataframe(gene_vals, use_container_width=True)
 
                 if "deg_results" in st.session_state and selected_gene in st.session_state["deg_results"].index:
