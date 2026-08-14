@@ -651,16 +651,57 @@ if expr_df is not None:
 
     all_samples = list(expr_df.columns)
 
-    # Determine available grouping columns from metadata
-    group_options = []
-    if meta_df is not None and not meta_df.empty:
-        common = set(meta_df.index) & set(all_samples)
-        if common:
-            for col in meta_df.columns:
-                vals = meta_df.loc[meta_df.index.isin(all_samples), col].dropna()
-                nunique = vals.nunique()
-                if 2 <= nunique <= 50:
-                    group_options.append(col)
+    # ── STEP 2: DEFINE GROUPS ─────────────────────────────────
+    st.markdown('<div class="step-header">Step 2 — Define Groups</div>', unsafe_allow_html=True)
+    st.markdown("Assign samples to named groups. These groups are used across all analyses (PCA, DEG, gene search).")
+
+    group_col_name = st.text_input("Group column name", value="condition", key="group_col_name")
+
+    # Dynamic group builder
+    if "n_groups" not in st.session_state:
+        st.session_state["n_groups"] = 2
+
+    gcol_add, gcol_remove = st.columns([1, 1])
+    with gcol_add:
+        if st.button("+ Add group", key="add_group"):
+            st.session_state["n_groups"] += 1
+    with gcol_remove:
+        if st.button("- Remove last group", key="remove_group") and st.session_state["n_groups"] > 2:
+            st.session_state["n_groups"] -= 1
+
+    n_groups = st.session_state["n_groups"]
+    group_cols = st.columns(min(n_groups, 4))
+
+    assigned_samples = []
+    group_assignments = {}  # sample -> group name
+    group_names = []
+    group_sample_lists = {}  # group name -> [samples]
+
+    for i in range(n_groups):
+        col = group_cols[i % len(group_cols)]
+        with col:
+            gname = st.text_input(f"Group {i+1} name", value=f"Group_{i+1}", key=f"gname_{i}")
+            group_names.append(gname)
+            available = [s for s in all_samples if s not in assigned_samples]
+            selected = st.multiselect(f"Samples", available, key=f"gsamples_{i}")
+            assigned_samples.extend(selected)
+            group_sample_lists[gname] = selected
+            for s in selected:
+                group_assignments[s] = gname
+
+    # Build a group metadata Series for use everywhere
+    group_series = pd.Series(group_assignments, name=group_col_name)
+    has_groups = len(group_assignments) >= 2
+
+    if has_groups:
+        n_assigned = len(group_assignments)
+        n_unassigned = len(all_samples) - n_assigned
+        msg = f"{n_assigned} samples assigned"
+        if n_unassigned > 0:
+            msg += f", {n_unassigned} unassigned"
+        st.caption(msg)
+
+    st.markdown("---")
 
     # ── TABS ──
     tab_preview, tab_pca, tab_deg, tab_gene = st.tabs(
@@ -672,8 +713,17 @@ if expr_df is not None:
         st.markdown('<div class="step-header">Expression Matrix</div>', unsafe_allow_html=True)
         st.dataframe(expr_df.head(50), use_container_width=True, height=400)
 
+        if has_groups:
+            st.markdown('<div class="step-header">Group Assignments</div>', unsafe_allow_html=True)
+            group_df = pd.DataFrame({
+                "sample": all_samples,
+                group_col_name: [group_assignments.get(s, "unassigned") for s in all_samples],
+            }).set_index("sample")
+            st.dataframe(group_df, use_container_width=True, height=300)
+
         if meta_df is not None and not meta_df.empty:
-            st.markdown('<div class="step-header">Sample Metadata</div>', unsafe_allow_html=True)
+            st.markdown('<div class="step-header">Sample Metadata (from source)</div>',
+                        unsafe_allow_html=True)
             st.dataframe(meta_df, use_container_width=True, height=300)
 
         csv_buf = expr_df.to_csv()
@@ -685,16 +735,36 @@ if expr_df is not None:
         st.markdown('<div class="step-header">Principal Component Analysis</div>',
                     unsafe_allow_html=True)
 
-        pca_color = None
-        if group_options:
-            pca_color = st.selectbox("Color samples by", ["None"] + group_options,
-                                     key="pca_color")
-            if pca_color == "None":
-                pca_color = None
-
         try:
             pca_df, variance = run_pca(expr_df)
-            fig = make_pca_plot(pca_df, variance, color_col=pca_color, meta_df=meta_df)
+
+            # Build plot dataframe with group info
+            plot_df = pca_df.copy()
+            plot_df.index.name = "sample"
+            plot_df = plot_df.reset_index()
+
+            if has_groups:
+                plot_df[group_col_name] = plot_df["sample"].map(group_assignments).fillna("unassigned")
+                color = group_col_name
+            else:
+                color = None
+
+            fig = px.scatter(
+                plot_df, x="PC1", y="PC2", color=color,
+                hover_name="sample",
+                labels={
+                    "PC1": f"PC1 ({variance[0]*100:.1f}%)",
+                    "PC2": f"PC2 ({variance[1]*100:.1f}%)",
+                },
+            )
+            fig.update_traces(marker=dict(size=10, line=dict(width=1, color="#1a1a1a")))
+            fig.update_layout(
+                template="plotly_white",
+                font_family="IBM Plex Mono",
+                plot_bgcolor="#faf8f4",
+                paper_bgcolor="#f0ece3",
+                width=800, height=600,
+            )
             st.plotly_chart(fig, use_container_width=True)
 
             with st.expander("PCA data"):
@@ -707,66 +777,70 @@ if expr_df is not None:
         st.markdown('<div class="step-header">Differential Expression Analysis</div>',
                     unsafe_allow_html=True)
 
-        st.markdown("Select samples for each group.")
-        mcol1, mcol2 = st.columns(2)
-        with mcol1:
-            group1_name = st.text_input("Group 1 name", value="Control", key="manual_g1_name")
-            group1_samples = st.multiselect(
-                f"Samples in **{group1_name}**", all_samples, key="manual_g1",
-            )
-        with mcol2:
-            available_for_g2 = [s for s in all_samples if s not in group1_samples]
-            group2_name = st.text_input("Group 2 name", value="Treatment", key="manual_g2_name")
-            group2_samples = st.multiselect(
-                f"Samples in **{group2_name}**", available_for_g2, key="manual_g2",
-            )
+        # Only groups with >= 2 samples can be used for DEG
+        valid_groups = [g for g, samples in group_sample_lists.items() if len(samples) >= 2]
 
-        is_counts = _looks_like_counts(expr_df)
-        use_deseq2 = is_counts
-
-        if is_counts:
-            st.caption("Data detected as raw counts — using DESeq2.")
+        if len(valid_groups) < 2:
+            st.warning("Define at least 2 groups with 2+ samples each in Step 2 to run DEG analysis.")
         else:
-            st.caption("Data appears normalized/log-transformed — using Welch's t-test.")
+            dcol1, dcol2 = st.columns(2)
+            with dcol1:
+                group1_name = st.selectbox("Control / Reference group", valid_groups, key="deg_g1")
+            with dcol2:
+                remaining = [g for g in valid_groups if g != group1_name]
+                group2_name = st.selectbox("Treatment / Comparison group", remaining, key="deg_g2")
 
-        padj_methods = ["Benjamini-Hochberg", "Benjamini-Yekutieli", "Bonferroni", "Holm"]
+            group1_samples = group_sample_lists[group1_name]
+            group2_samples = group_sample_lists[group2_name]
 
-        tcol1, tcol2, tcol3, tcol4 = st.columns(4)
-        with tcol1:
-            fc_thresh = st.number_input("log₂FC threshold", value=1.0, min_value=0.0,
-                                        step=0.25, key="fc_thresh")
-        with tcol2:
-            pval_thresh = st.number_input("Adj. p-value threshold", value=0.05,
-                                          min_value=0.001, max_value=1.0,
-                                          step=0.01, format="%.3f", key="pval_thresh")
-        with tcol3:
-            padj_method = st.selectbox("P-value adjustment", padj_methods, key="padj_method")
-        with tcol4:
-            top_labels = st.number_input("Top genes to label", value=10, min_value=0,
-                                         max_value=50, key="top_labels")
+            st.caption(f"{group1_name}: {len(group1_samples)} samples — "
+                       f"{group2_name}: {len(group2_samples)} samples")
 
-        can_run_deg = len(group1_samples) >= 2 and len(group2_samples) >= 2
+            is_counts = _looks_like_counts(expr_df)
+            use_deseq2 = is_counts
 
-        if st.button("Run DEG Analysis", type="primary", key="run_deg", disabled=not can_run_deg):
-            with st.spinner("Running analysis..."):
-                try:
-                    deg_results = run_deg_analysis(
-                        expr_df, group1_samples, group2_samples,
-                        group1_name, group2_name, use_deseq2=use_deseq2,
-                        padj_method=padj_method,
-                    )
-                    st.session_state["deg_results"] = deg_results
-                except Exception as e:
-                    st.error(f"DEG analysis failed: {str(e)}")
+            if is_counts:
+                st.caption("Data detected as raw counts — using DESeq2.")
+            else:
+                st.caption("Data appears normalized/log-transformed — using Welch's t-test.")
 
-        if not can_run_deg:
-            st.caption("Select at least 2 samples per group to run analysis.")
+            padj_methods = ["Benjamini-Hochberg", "Benjamini-Yekutieli", "Bonferroni", "Holm"]
+
+            tcol1, tcol2, tcol3, tcol4 = st.columns(4)
+            with tcol1:
+                fc_thresh = st.number_input("log₂FC threshold", value=1.0, min_value=0.0,
+                                            step=0.25, key="fc_thresh")
+            with tcol2:
+                pval_thresh = st.number_input("Adj. p-value threshold", value=0.05,
+                                              min_value=0.001, max_value=1.0,
+                                              step=0.01, format="%.3f", key="pval_thresh")
+            with tcol3:
+                padj_method = st.selectbox("P-value adjustment", padj_methods, key="padj_method")
+            with tcol4:
+                top_labels = st.number_input("Top genes to label", value=10, min_value=0,
+                                             max_value=50, key="top_labels")
+
+            if st.button("Run DEG Analysis", type="primary", key="run_deg"):
+                with st.spinner("Running analysis..."):
+                    try:
+                        deg_results = run_deg_analysis(
+                            expr_df, group1_samples, group2_samples,
+                            group1_name, group2_name, use_deseq2=use_deseq2,
+                            padj_method=padj_method,
+                        )
+                        st.session_state["deg_results"] = deg_results
+                    except Exception as e:
+                        st.error(f"DEG analysis failed: {str(e)}")
 
         if "deg_results" in st.session_state:
             deg_results = st.session_state["deg_results"]
 
-            n_up = ((deg_results["padj"] < pval_thresh) & (deg_results["log2FC"] > fc_thresh)).sum()
-            n_down = ((deg_results["padj"] < pval_thresh) & (deg_results["log2FC"] < -fc_thresh)).sum()
+            fc_t = fc_thresh if "fc_thresh" in dir() else 1.0
+            pv_t = pval_thresh if "pval_thresh" in dir() else 0.05
+            tl = top_labels if "top_labels" in dir() else 10
+
+            n_up = ((deg_results["padj"] < pv_t) & (deg_results["log2FC"] > fc_t)).sum()
+            n_down = ((deg_results["padj"] < pv_t) & (deg_results["log2FC"] < -fc_t)).sum()
 
             rcol1, rcol2, rcol3 = st.columns(3)
             rcol1.metric("Total genes tested", f"{len(deg_results):,}")
@@ -774,8 +848,8 @@ if expr_df is not None:
             rcol3.metric("Downregulated", f"{n_down:,}")
 
             st.markdown('<div class="step-header">Volcano Plot</div>', unsafe_allow_html=True)
-            fig = make_volcano_plot(deg_results, fc_thresh=fc_thresh,
-                                    pval_thresh=pval_thresh, top_n_labels=top_labels)
+            fig = make_volcano_plot(deg_results, fc_thresh=fc_t,
+                                    pval_thresh=pv_t, top_n_labels=tl)
             st.plotly_chart(fig, use_container_width=True)
 
             with st.expander("DEG results table"):
@@ -794,13 +868,6 @@ if expr_df is not None:
 
         gene_query = st.text_input("Search for a gene", placeholder="e.g. TP53, BRCA1, GAPDH")
 
-        gene_group_col = None
-        if group_options:
-            gene_group_col = st.selectbox("Group samples by", ["None"] + group_options,
-                                          key="gene_group")
-            if gene_group_col == "None":
-                gene_group_col = None
-
         if gene_query:
             query = gene_query.strip().upper()
             exact = [g for g in expr_df.index if str(g).upper() == query]
@@ -815,21 +882,44 @@ if expr_df is not None:
                 else:
                     selected_gene = matches[0]
 
-                fig = make_gene_plot(expr_df, selected_gene, meta_df=meta_df,
-                                     group_col=gene_group_col)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                # Build plot with group coloring
+                values = expr_df.loc[selected_gene]
+                plot_df = pd.DataFrame({"sample": values.index, "expression": values.values})
 
-                    with st.expander("Expression values"):
-                        gene_vals = expr_df.loc[selected_gene].to_frame("expression")
-                        if meta_df is not None and gene_group_col:
-                            gene_vals = gene_vals.merge(
-                                meta_df[[gene_group_col]], left_index=True,
-                                right_index=True, how="left"
-                            )
-                        st.dataframe(gene_vals, use_container_width=True)
+                if has_groups:
+                    plot_df[group_col_name] = plot_df["sample"].map(group_assignments).fillna("unassigned")
+                    fig = px.box(
+                        plot_df, x=group_col_name, y="expression",
+                        points="all", hover_name="sample",
+                        color=group_col_name,
+                        labels={"expression": "Expression"},
+                    )
+                else:
+                    fig = px.strip(
+                        plot_df, x="sample", y="expression",
+                        hover_name="sample",
+                        labels={"expression": "Expression"},
+                    )
+                    fig.update_xaxes(tickangle=45)
 
-                    if "deg_results" in st.session_state and selected_gene in st.session_state["deg_results"].index:
-                        gene_deg = st.session_state["deg_results"].loc[selected_gene]
-                        st.markdown(f"**DEG stats:** log₂FC = {gene_deg['log2FC']:.3f}, "
-                                    f"p-adj = {gene_deg['padj']:.2e}")
+                fig.update_layout(
+                    title=f"{selected_gene}",
+                    template="plotly_white",
+                    font_family="IBM Plex Mono",
+                    plot_bgcolor="#faf8f4",
+                    paper_bgcolor="#f0ece3",
+                    showlegend=False,
+                    width=800, height=500,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("Expression values"):
+                    gene_vals = expr_df.loc[selected_gene].to_frame("expression")
+                    if has_groups:
+                        gene_vals[group_col_name] = gene_vals.index.map(group_assignments).fillna("unassigned")
+                    st.dataframe(gene_vals, use_container_width=True)
+
+                if "deg_results" in st.session_state and selected_gene in st.session_state["deg_results"].index:
+                    gene_deg = st.session_state["deg_results"].loc[selected_gene]
+                    st.markdown(f"**DEG stats:** log₂FC = {gene_deg['log2FC']:.3f}, "
+                                f"p-adj = {gene_deg['padj']:.2e}")
