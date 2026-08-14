@@ -42,22 +42,57 @@ div[data-testid="stSidebar"] { background-color: #e8e4db; border-right: 1.5px da
 # HELPER FUNCTIONS
 # ============================================================
 
-def _bh_adjust(pvalues):
-    """Benjamini-Hochberg p-value adjustment."""
+def _adjust_pvalues(pvalues, method="Benjamini-Hochberg"):
+    """Adjust p-values for multiple testing.
+
+    Methods:
+      - Benjamini-Hochberg (BH): controls FDR
+      - Benjamini-Yekutieli (BY): controls FDR under dependence
+      - Bonferroni: controls FWER (most conservative)
+      - Holm: step-down Bonferroni (controls FWER, less conservative)
+    """
     pvalues = np.asarray(pvalues, dtype=float)
     n = len(pvalues)
     if n == 0:
         return pvalues
+
     sorted_idx = np.argsort(pvalues)
     sorted_pvals = pvalues[sorted_idx]
     adjusted = np.empty(n)
-    adjusted[-1] = sorted_pvals[-1]
-    for i in range(n - 2, -1, -1):
-        adjusted[i] = min(adjusted[i + 1], sorted_pvals[i] * n / (i + 1))
-    adjusted = np.clip(adjusted, 0, 1)
-    result = np.empty(n)
-    result[sorted_idx] = adjusted
-    return result
+
+    if method == "Bonferroni":
+        result = np.clip(pvalues * n, 0, 1)
+        return result
+
+    elif method == "Holm":
+        for i in range(n):
+            adjusted[i] = sorted_pvals[i] * (n - i)
+        # Enforce monotonicity (step-up)
+        for i in range(1, n):
+            adjusted[i] = max(adjusted[i], adjusted[i - 1])
+        adjusted = np.clip(adjusted, 0, 1)
+        result = np.empty(n)
+        result[sorted_idx] = adjusted
+        return result
+
+    elif method == "Benjamini-Yekutieli":
+        c_n = sum(1.0 / k for k in range(1, n + 1))
+        adjusted[-1] = min(1.0, sorted_pvals[-1] * c_n)
+        for i in range(n - 2, -1, -1):
+            adjusted[i] = min(adjusted[i + 1], sorted_pvals[i] * n * c_n / (i + 1))
+        adjusted = np.clip(adjusted, 0, 1)
+        result = np.empty(n)
+        result[sorted_idx] = adjusted
+        return result
+
+    else:  # Benjamini-Hochberg (default)
+        adjusted[-1] = sorted_pvals[-1]
+        for i in range(n - 2, -1, -1):
+            adjusted[i] = min(adjusted[i + 1], sorted_pvals[i] * n / (i + 1))
+        adjusted = np.clip(adjusted, 0, 1)
+        result = np.empty(n)
+        result[sorted_idx] = adjusted
+        return result
 
 
 def _looks_like_counts(expr_df):
@@ -324,8 +359,9 @@ def _run_pydeseq2(expr_df, group1_samples, group2_samples, group1_name, group2_n
     return results
 
 
-def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_name):
-    """Run basic DEG analysis using t-test for normalized data."""
+def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_name,
+                   padj_method="Benjamini-Hochberg"):
+    """Run basic DEG analysis using Welch's t-test."""
     g1 = expr_df[group1_samples].copy()
     g2 = expr_df[group2_samples].copy()
 
@@ -359,7 +395,7 @@ def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_
     pvalues[valid] = 2 * stats.t.sf(np.abs(t_stat[valid]), df_welch[valid])
     pvalues = pvalues.fillna(1.0).values
 
-    padj = _bh_adjust(pvalues)
+    padj = _adjust_pvalues(pvalues, method=padj_method)
 
     results = pd.DataFrame({
         "log2FC": log2fc,
@@ -375,14 +411,14 @@ def _run_basic_deg(expr_df, group1_samples, group2_samples, group1_name, group2_
 
 
 def run_deg_analysis(expr_df, group1_samples, group2_samples, group1_name, group2_name,
-                     use_deseq2=False):
+                     use_deseq2=False, padj_method="Benjamini-Hochberg"):
     """Run differential expression analysis."""
     if use_deseq2:
         return _run_pydeseq2(expr_df, group1_samples, group2_samples,
                              group1_name, group2_name)
     else:
         return _run_basic_deg(expr_df, group1_samples, group2_samples,
-                              group1_name, group2_name)
+                              group1_name, group2_name, padj_method=padj_method)
 
 
 def make_volcano_plot(deg_results, fc_thresh=1.0, pval_thresh=0.05, top_n_labels=10):
@@ -671,76 +707,31 @@ if expr_df is not None:
         st.markdown('<div class="step-header">Differential Expression Analysis</div>',
                     unsafe_allow_html=True)
 
-        deg_mode = st.radio(
-            "How would you like to define groups?",
-            ["From metadata column", "Manual sample selection"],
-            horizontal=True, key="deg_mode",
-        )
-
-        group1_samples = []
-        group2_samples = []
-        group1_name = "Control"
-        group2_name = "Treatment"
-
-        if deg_mode == "From metadata column":
-            if not group_options:
-                st.warning("No usable grouping columns found in metadata. "
-                           "Use **Manual sample selection** instead.")
-            else:
-                deg_group_col = st.selectbox("Group samples by", group_options, key="deg_group")
-                groups = meta_df.loc[
-                    meta_df.index.isin(all_samples), deg_group_col
-                ].dropna().unique().tolist()
-
-                dcol1, dcol2 = st.columns(2)
-                with dcol1:
-                    group1_name = st.selectbox("Control / Reference group", groups, key="g1")
-                with dcol2:
-                    remaining = [g for g in groups if g != group1_name]
-                    group2_name = st.selectbox("Treatment / Comparison group",
-                                               remaining if remaining else groups, key="g2")
-
-                group1_samples = meta_df[
-                    (meta_df[deg_group_col] == group1_name) &
-                    (meta_df.index.isin(all_samples))
-                ].index.tolist()
-                group2_samples = meta_df[
-                    (meta_df[deg_group_col] == group2_name) &
-                    (meta_df.index.isin(all_samples))
-                ].index.tolist()
-
-                st.caption(f"Group 1: {len(group1_samples)} samples — "
-                           f"Group 2: {len(group2_samples)} samples")
-
-        else:
-            st.markdown("Select samples for each group from the expression matrix columns.")
-            mcol1, mcol2 = st.columns(2)
-            with mcol1:
-                group1_name = st.text_input("Group 1 name", value="Control", key="manual_g1_name")
-                group1_samples = st.multiselect(
-                    f"Samples in **{group1_name}**", all_samples, key="manual_g1",
-                )
-            with mcol2:
-                available_for_g2 = [s for s in all_samples if s not in group1_samples]
-                group2_name = st.text_input("Group 2 name", value="Treatment", key="manual_g2_name")
-                group2_samples = st.multiselect(
-                    f"Samples in **{group2_name}**", available_for_g2, key="manual_g2",
-                )
+        st.markdown("Select samples for each group.")
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            group1_name = st.text_input("Group 1 name", value="Control", key="manual_g1_name")
+            group1_samples = st.multiselect(
+                f"Samples in **{group1_name}**", all_samples, key="manual_g1",
+            )
+        with mcol2:
+            available_for_g2 = [s for s in all_samples if s not in group1_samples]
+            group2_name = st.text_input("Group 2 name", value="Treatment", key="manual_g2_name")
+            group2_samples = st.multiselect(
+                f"Samples in **{group2_name}**", available_for_g2, key="manual_g2",
+            )
 
         is_counts = _looks_like_counts(expr_df)
+        use_deseq2 = is_counts
 
         if is_counts:
-            method = st.radio(
-                "Analysis method",
-                ["DESeq2 (recommended for count data)", "Basic t-test"],
-                horizontal=True, key="deg_method",
-            )
-            use_deseq2 = "DESeq2" in method
+            st.caption("Data detected as raw counts — using DESeq2.")
         else:
-            st.caption("Data appears to be normalized/log-transformed — using t-test with BH correction.")
-            use_deseq2 = False
+            st.caption("Data appears normalized/log-transformed — using Welch's t-test.")
 
-        tcol1, tcol2, tcol3 = st.columns(3)
+        padj_methods = ["Benjamini-Hochberg", "Benjamini-Yekutieli", "Bonferroni", "Holm"]
+
+        tcol1, tcol2, tcol3, tcol4 = st.columns(4)
         with tcol1:
             fc_thresh = st.number_input("log₂FC threshold", value=1.0, min_value=0.0,
                                         step=0.25, key="fc_thresh")
@@ -749,6 +740,8 @@ if expr_df is not None:
                                           min_value=0.001, max_value=1.0,
                                           step=0.01, format="%.3f", key="pval_thresh")
         with tcol3:
+            padj_method = st.selectbox("P-value adjustment", padj_methods, key="padj_method")
+        with tcol4:
             top_labels = st.number_input("Top genes to label", value=10, min_value=0,
                                          max_value=50, key="top_labels")
 
@@ -760,6 +753,7 @@ if expr_df is not None:
                     deg_results = run_deg_analysis(
                         expr_df, group1_samples, group2_samples,
                         group1_name, group2_name, use_deseq2=use_deseq2,
+                        padj_method=padj_method,
                     )
                     st.session_state["deg_results"] = deg_results
                 except Exception as e:
