@@ -367,13 +367,18 @@ def make_volcano_plot(deg_results, fc_thresh=1.0, pval_thresh=0.05, top_n_labels
 
     color_map = {"Not significant": "#c0bbb0", "Up": "#cc2a2a", "Down": "#2a52cc"}
 
+    plot_df = df.reset_index()
+    # Normalise the gene name column to "gene" regardless of original index name
+    gene_col = plot_df.columns[0]
+    plot_df = plot_df.rename(columns={gene_col: "gene"})
+
     fig = px.scatter(
-        df.reset_index(),
+        plot_df,
         x="log2FC",
         y="neg_log10_padj",
         color="significant",
         color_discrete_map=color_map,
-        hover_name="index",
+        hover_name="gene",
         hover_data={"log2FC": ":.2f", "padj": ":.2e", "significant": False, "neg_log10_padj": False},
         labels={"log2FC": "log₂ Fold Change", "neg_log10_padj": "-log₁₀ adjusted p-value"},
     )
